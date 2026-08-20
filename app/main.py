@@ -14,12 +14,23 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./eblannft-sync.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 TOKEN_PEPPER = os.getenv("TOKEN_PEPPER", "")
 
+# Railway exposes PostgreSQL URLs as postgresql://... (and some providers still
+# use postgres://...). SQLAlchemy interprets plain postgresql:// as psycopg2,
+# while this project intentionally uses psycopg 3. Normalize the scheme so the
+# correct driver is selected without requiring users to edit Railway variables.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
+
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
+
 class Base(DeclarativeBase):
     pass
+
 
 class Profile(Base):
     __tablename__ = "profiles"
@@ -28,17 +39,21 @@ class Profile(Base):
     state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
+
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="eblannft-sync", version="1.0.0")
+app = FastAPI(title="eblannft-sync", version="1.0.1")
+
 
 class IssueTokenRequest(BaseModel):
     telegram_id: int = Field(gt=0)
     rotate: bool = False
 
+
 class IssueTokenResponse(BaseModel):
     telegram_id: int
     token: str
+
 
 class ProfileState(BaseModel):
     verification: dict[str, Any] | None = None
@@ -82,10 +97,12 @@ def bearer_token(authorization: str | None = Header(default=None)) -> str:
         raise HTTPException(401, "invalid bearer token")
     return token
 
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     count = len(db.scalars(select(Profile.telegram_id)).all())
     return {"ok": True, "version": app.version, "users": count}
+
 
 @app.post("/v1/admin/issue-token", response_model=IssueTokenResponse, dependencies=[Depends(require_admin)])
 def issue_token(req: IssueTokenRequest, db: Session = Depends(get_db)):
@@ -104,6 +121,7 @@ def issue_token(req: IssueTokenRequest, db: Session = Depends(get_db)):
     db.commit()
     return IssueTokenResponse(telegram_id=req.telegram_id, token=token)
 
+
 @app.get("/v1/profile/{telegram_id}")
 def get_profile(telegram_id: int, db: Session = Depends(get_db)):
     row = db.get(Profile, telegram_id)
@@ -115,6 +133,7 @@ def get_profile(telegram_id: int, db: Session = Depends(get_db)):
         "state": row.state or {},
         "updated_at": row.updated_at.isoformat(),
     }
+
 
 @app.put("/v1/profile/me")
 def put_my_profile(state: ProfileState, token: str = Depends(bearer_token), db: Session = Depends(get_db)):
