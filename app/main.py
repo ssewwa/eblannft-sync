@@ -14,10 +14,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./eblannft-sync.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 TOKEN_PEPPER = os.getenv("TOKEN_PEPPER", "")
 
-# Railway exposes PostgreSQL URLs as postgresql://... (and some providers still
-# use postgres://...). SQLAlchemy interprets plain postgresql:// as psycopg2,
-# while this project intentionally uses psycopg 3. Normalize the scheme so the
-# correct driver is selected without requiring users to edit Railway variables.
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
 elif DATABASE_URL.startswith("postgres://"):
@@ -42,7 +38,7 @@ class Profile(Base):
 
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="eblannft-sync", version="1.0.1")
+app = FastAPI(title="eblannft-sync", version="1.1.0")
 
 
 class IssueTokenRequest(BaseModel):
@@ -98,6 +94,37 @@ def bearer_token(authorization: str | None = Header(default=None)) -> str:
     return token
 
 
+def parse_user_key(user_key: str) -> int:
+    value = str(user_key or "").strip()
+    for prefix in ("tg-main:", "tg:"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    try:
+        uid = int(value)
+    except Exception:
+        raise HTTPException(400, "invalid user key")
+    if uid <= 0:
+        raise HTTPException(400, "invalid user key")
+    return uid
+
+
+def profile_for_plugin_key(plugin_key: str | None, db: Session) -> Profile:
+    token = str(plugin_key or "").strip()
+    if len(token) < 24:
+        raise HTTPException(401, "missing or invalid X-Plugin-Key")
+    row = db.scalar(select(Profile).where(Profile.token_hash == hash_token(token)))
+    if row is None:
+        raise HTTPException(401, "unknown plugin token")
+    return row
+
+
+def bounded_state(payload: dict[str, Any]) -> dict[str, Any]:
+    if len(str(payload)) > 2_000_000:
+        raise HTTPException(413, "state too large")
+    return payload
+
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     count = len(db.scalars(select(Profile.telegram_id)).all())
@@ -141,10 +168,44 @@ def put_my_profile(state: ProfileState, token: str = Depends(bearer_token), db: 
     row = db.scalar(select(Profile).where(Profile.token_hash == token_hash))
     if row is None:
         raise HTTPException(401, "unknown token")
-    payload = state.model_dump(mode="json")
-    if len(str(payload)) > 2_000_000:
-        raise HTTPException(413, "state too large")
-    row.state = payload
+    row.state = bounded_state(state.model_dump(mode="json"))
     row.updated_at = now()
     db.commit()
     return {"ok": True, "telegram_id": row.telegram_id, "updated_at": row.updated_at.isoformat()}
+
+
+# Compatibility API for the original eblanNFT Java/DEX SyncClient.
+# The DEX already knows how to serialize gifts/wear/profile cosmetics and how to
+# apply another plugin user's state. We keep its wire format but authenticate
+# writes with a per-user token instead of the original shared server key.
+@app.get("/api/v1/users/{user_key}/state")
+def legacy_get_state(user_key: str, db: Session = Depends(get_db)):
+    uid = parse_user_key(user_key)
+    row = db.get(Profile, uid)
+    if row is None:
+        raise HTTPException(404, "profile not found")
+    payload = dict(row.state or {})
+    payload.setdefault("updated_at", int(row.updated_at.timestamp()))
+    return payload
+
+
+@app.put("/api/v1/users/{user_key}/state")
+def legacy_put_state(
+    user_key: str,
+    state: dict[str, Any],
+    x_plugin_key: str | None = Header(default=None, alias="X-Plugin-Key"),
+    db: Session = Depends(get_db),
+):
+    uid = parse_user_key(user_key)
+    row = profile_for_plugin_key(x_plugin_key, db)
+    if int(row.telegram_id) != uid:
+        raise HTTPException(403, "token does not own this Telegram id")
+    row.state = bounded_state(dict(state or {}))
+    row.updated_at = now()
+    db.commit()
+    return {"ok": True, "telegram_id": uid, "updated_at": int(row.updated_at.timestamp())}
+
+
+@app.get("/api/v1/badges")
+def legacy_badges():
+    return {"badges": []}
