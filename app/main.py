@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, JSON, String, create_engine, select
+from sqlalchemy import BigInteger, DateTime, JSON, String, create_engine, delete, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./eblannft-sync.db")
@@ -36,9 +37,18 @@ class Profile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class TransferEvent(Base):
+    __tablename__ = "transfer_events"
+    event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    sender_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    receiver_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="eblannft-sync", version="1.1.0")
+app = FastAPI(title="eblannft-sync", version="1.2.0")
 
 
 class IssueTokenRequest(BaseModel):
@@ -120,15 +130,23 @@ def profile_for_plugin_key(plugin_key: str | None, db: Session) -> Profile:
 
 
 def bounded_state(payload: dict[str, Any]) -> dict[str, Any]:
-    if len(str(payload)) > 2_000_000:
+    if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) > 2_000_000:
         raise HTTPException(413, "state too large")
     return payload
+
+
+def require_receiver_owner(receiver_id: int, plugin_key: str | None, db: Session) -> Profile:
+    row = profile_for_plugin_key(plugin_key, db)
+    if int(row.telegram_id) != int(receiver_id):
+        raise HTTPException(403, "token does not own this receiver")
+    return row
 
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     count = len(db.scalars(select(Profile.telegram_id)).all())
-    return {"ok": True, "version": app.version, "users": count}
+    queued = len(db.scalars(select(TransferEvent.event_id)).all())
+    return {"ok": True, "version": app.version, "users": count, "queued_transfers": queued}
 
 
 @app.post("/v1/admin/issue-token", response_model=IssueTokenResponse, dependencies=[Depends(require_admin)])
@@ -175,9 +193,6 @@ def put_my_profile(state: ProfileState, token: str = Depends(bearer_token), db: 
 
 
 # Compatibility API for the original eblanNFT Java/DEX SyncClient.
-# The DEX already knows how to serialize gifts/wear/profile cosmetics and how to
-# apply another plugin user's state. We keep its wire format but authenticate
-# writes with a per-user token instead of the original shared server key.
 @app.get("/api/v1/users/{user_key}/state")
 def legacy_get_state(user_key: str, db: Session = Depends(get_db)):
     uid = parse_user_key(user_key)
@@ -209,3 +224,110 @@ def legacy_put_state(
 @app.get("/api/v1/badges")
 def legacy_badges():
     return {"badges": []}
+
+
+# Native gift-transfer inbox expected by the embedded eblanNFT DEX.
+# DEX flow:
+#   sender:   PUT  /api/v1/transfers/{receiver_id}  with an opaque gift event JSON
+#   receiver: GET  /api/v1/transfers/{receiver_id}
+#   receiver: POST /api/v1/transfers/{receiver_id}/ack {"event_ids":[...]}
+# The client itself converts these events into Telegram TL_messageService with
+# TL_messageActionStarGift / TL_messageActionStarGiftUnique and inserts them in ChatActivity.
+@app.put("/api/v1/transfers/{receiver_id}")
+def push_transfer(
+    receiver_id: int,
+    event: dict[str, Any],
+    x_plugin_key: str | None = Header(default=None, alias="X-Plugin-Key"),
+    db: Session = Depends(get_db),
+):
+    sender = profile_for_plugin_key(x_plugin_key, db)
+    payload = bounded_state(dict(event or {}))
+
+    try:
+        body_receiver = int(payload.get("receiver_id", receiver_id))
+    except Exception:
+        raise HTTPException(400, "bad receiver_id")
+    if body_receiver != int(receiver_id):
+        raise HTTPException(400, "receiver_id mismatch")
+
+    try:
+        body_sender = int(payload.get("sender_id", sender.telegram_id))
+    except Exception:
+        raise HTTPException(400, "bad sender_id")
+    if body_sender != int(sender.telegram_id):
+        raise HTTPException(403, "sender_id does not match token owner")
+
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        event_id = hashlib.sha256(
+            (f"{body_sender}:{receiver_id}:" + canonical).encode("utf-8")
+        ).hexdigest()[:48]
+        payload["event_id"] = event_id
+
+    if len(event_id) > 160:
+        raise HTTPException(400, "event_id too long")
+
+    existing = db.get(TransferEvent, event_id)
+    if existing is None:
+        event_time = now()
+        raw_ts = payload.get("date") or payload.get("created_at")
+        try:
+            ts = int(raw_ts or 0)
+            if ts > 10_000_000_000:
+                ts //= 1000
+            if ts > 0:
+                event_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            pass
+        db.add(
+            TransferEvent(
+                event_id=event_id,
+                sender_id=body_sender,
+                receiver_id=int(receiver_id),
+                payload=payload,
+                created_at=event_time,
+            )
+        )
+        db.commit()
+
+    return {"ok": True, "event_id": event_id}
+
+
+@app.get("/api/v1/transfers/{receiver_id}")
+def fetch_transfers(
+    receiver_id: int,
+    x_plugin_key: str | None = Header(default=None, alias="X-Plugin-Key"),
+    db: Session = Depends(get_db),
+):
+    require_receiver_owner(receiver_id, x_plugin_key, db)
+    rows = db.scalars(
+        select(TransferEvent)
+        .where(TransferEvent.receiver_id == int(receiver_id))
+        .order_by(TransferEvent.created_at.asc())
+        .limit(200)
+    ).all()
+    return {"transfers": [dict(row.payload or {}) for row in rows]}
+
+
+@app.post("/api/v1/transfers/{receiver_id}/ack")
+def ack_transfers(
+    receiver_id: int,
+    body: dict[str, Any],
+    x_plugin_key: str | None = Header(default=None, alias="X-Plugin-Key"),
+    db: Session = Depends(get_db),
+):
+    require_receiver_owner(receiver_id, x_plugin_key, db)
+    raw_ids = body.get("event_ids") if isinstance(body, dict) else None
+    ids = [str(x).strip() for x in (raw_ids or []) if str(x).strip()]
+    if not ids:
+        return {"ok": True, "acked": 0}
+
+    result = db.execute(
+        delete(TransferEvent).where(
+            TransferEvent.receiver_id == int(receiver_id),
+            TransferEvent.event_id.in_(ids),
+        )
+    )
+    db.commit()
+    return {"ok": True, "acked": int(result.rowcount or 0)}
