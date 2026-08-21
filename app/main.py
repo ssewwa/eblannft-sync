@@ -48,7 +48,7 @@ class TransferEvent(Base):
 
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="eblannft-sync", version="1.2.0")
+app = FastAPI(title="eblannft-sync", version="1.2.1")
 
 
 class IssueTokenRequest(BaseModel):
@@ -228,11 +228,11 @@ def legacy_badges():
 
 # Native gift-transfer inbox expected by the embedded eblanNFT DEX.
 # DEX flow:
-#   sender:   PUT  /api/v1/transfers/{receiver_id}  with an opaque gift event JSON
+#   sender:   POST /api/v1/transfers/{receiver_id} with an opaque gift event JSON
 #   receiver: GET  /api/v1/transfers/{receiver_id}
 #   receiver: POST /api/v1/transfers/{receiver_id}/ack {"event_ids":[...]}
-# The client itself converts these events into Telegram TL_messageService with
-# TL_messageActionStarGift / TL_messageActionStarGiftUnique and inserts them in ChatActivity.
+# PUT stays enabled as a compatibility alias for older experimental builds.
+@app.post("/api/v1/transfers/{receiver_id}")
 @app.put("/api/v1/transfers/{receiver_id}")
 def push_transfer(
     receiver_id: int,
